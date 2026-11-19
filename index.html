@@ -53,8 +53,6 @@
   <input id="threshold" type="number" value="30" min="5">
   <label>連続何回超えたら判定するか（誤検知防止）</label>
   <input id="needCount" type="number" value="3" min="1">
-  <label>通知メッセージ</label>
-  <input id="message" type="text" value="電動キックボードを返し忘れていませんか？">
   <label>再通知の間隔（分・0で1回だけ）</label>
   <input id="repeatMin" type="number" value="3" min="0">
 
@@ -85,6 +83,7 @@ let state = "idle";        // idle | near | far
 let overCount = 0;
 let watchId = null, pollTimer = null, tickTimer = null;
 let lastNotifyAt = 0;
+const REMINDER_MESSAGE = "電動キックボードを返し忘れていませんか？";  // 変更する場合はここ（画面からは変更不可）
 const HYSTERESIS = 0.8;    // 復帰は閾値の80%以下になったとき（境界でのバタつき防止）
 const STALE_MS = 15000;    // キックボードのデータがこれより古いと警告
 
@@ -125,7 +124,7 @@ async function onSeparated(dist) {
 // 「返し忘れていませんか」通知（端末通知 + 画面バナー + バイブ + 音）
 function notifyReminder(dist) {
   lastNotifyAt = Date.now();
-  const msg = $("message").value || "電動キックボードを返し忘れていませんか？";
+  const msg = REMINDER_MESSAGE;
   const detail = dist != null ? `（${dist.toFixed(0)} m 離れています）` : "";
   if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 500]);
   beep();
