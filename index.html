@@ -18,6 +18,7 @@
   #banner { display: none; margin-bottom: 12px; padding: 14px; border-radius: 12px; background: #e65100; color: #fff; font-weight: bold; }
   #banner button { background: #fff; color: #e65100; border: 0; border-radius: 8px; }
   .row { display: flex; justify-content: space-between; }
+  .hint { font-size: .8rem; opacity: .8; margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -30,16 +31,23 @@
   <div class="row"><span>距離</span><b id="dist">-</b></div>
   <div class="row"><span>スマホ精度</span><span id="accPhone">-</span></div>
   <div class="row"><span>キックボード最終受信</span><span id="kickAge">-</span></div>
+  <div class="row"><span>Bluetooth</span><span id="bleState">未接続</span></div>
 </div>
 
 <div class="card">
   <label>キックボード位置の取得方法</label>
   <select id="mode">
+    <option value="ble">ESP32-C3（Bluetooth）</option>
     <option value="demo">デモ（スマホ位置からずらして擬似生成）</option>
     <option value="api">サーバAPIから取得</option>
   </select>
 
-  <div id="demoBox">
+  <div id="bleBox">
+    <button id="bleBtn" type="button">ESP32-C3に接続</button>
+    <div class="hint">Android: Chrome ／ iPhone: Bluefy アプリで開いてください（iPhoneのSafariは非対応）。接続後に「監視開始」を押します。</div>
+  </div>
+
+  <div id="demoBox" hidden>
     <label>デモ用: キックボードとの距離 <b id="demoVal">5</b> m</label>
     <input id="demoDist" type="range" min="0" max="100" value="5">
   </div>
@@ -83,6 +91,7 @@ let state = "idle";        // idle | near | far
 let overCount = 0;
 let watchId = null, pollTimer = null, tickTimer = null;
 let lastNotifyAt = 0;
+let audioCtx = null, wakeLock = null;
 const REMINDER_MESSAGE = "電動キックボードを返し忘れていませんか？";  // 変更する場合はここ（画面からは変更不可）
 const HYSTERESIS = 0.8;    // 復帰は閾値の80%以下になったとき（境界でのバタつき防止）
 const STALE_MS = 15000;    // キックボードのデータがこれより古いと警告
@@ -107,6 +116,54 @@ function offsetNorth(p, meter) {
   return { lat: p.lat + meter / 111320, lng: p.lng, accuracy: 5, timestamp: Date.now() };
 }
 
+// ====== BLE（ESP32-C3） ======
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const CHAR_UUID    = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+let bleDevice = null, bleRetry = 0, bleUserStop = false;
+
+async function connectBle() {
+  if (!navigator.bluetooth) {
+    return log("このブラウザはBluetooth非対応です。Android→Chrome、iPhone→Bluefyで開いてください");
+  }
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+    bleDevice.addEventListener("gattserverdisconnected", onBleDisconnected);
+    bleUserStop = false; bleRetry = 0;
+    await openGatt();
+  } catch (e) { log("BLE接続失敗: " + e.message); }
+}
+
+async function openGatt() {
+  const server = await bleDevice.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE_UUID);
+  const ch = await service.getCharacteristic(CHAR_UUID);
+  ch.addEventListener("characteristicvaluechanged", onBleData);
+  await ch.startNotifications();
+  $("bleState").textContent = "接続中: " + (bleDevice.name || "");
+  log("BLE接続しました: " + bleDevice.name);
+}
+
+// 切断されたら数回だけ自動で再接続を試みる
+function onBleDisconnected() {
+  $("bleState").textContent = "切断";
+  log("BLE切断されました");
+  if (bleUserStop || bleRetry >= 10) return;
+  bleRetry++;
+  setTimeout(async () => {
+    try { await openGatt(); bleRetry = 0; }
+    catch (e) { log(`再接続失敗(${bleRetry}/10): ` + e.message); onBleDisconnected(); }
+  }, 3000);
+}
+
+// 受信データ "緯度,経度,精度" または "NOFIX"（GPS未測位）
+function onBleData(ev) {
+  const text = new TextDecoder().decode(ev.target.value).trim();
+  if (text.startsWith("NOFIX")) { kick = null; $("kickAge").textContent = "GPS未測位"; return; }
+  const [lat, lng, acc] = text.split(",").map(Number);
+  if ([lat, lng].some(isNaN)) return;
+  kick = { lat, lng, accuracy: acc || 10, timestamp: Date.now() };
+}
+
 // ====== 「離れた」ときに実行する処理（ここを自由に改造） ======
 async function onSeparated(dist) {
   log(`⚠ 離れました: ${dist.toFixed(1)} m`);
@@ -126,7 +183,7 @@ function notifyReminder(dist) {
   lastNotifyAt = Date.now();
   const msg = REMINDER_MESSAGE;
   const detail = dist != null ? `（${dist.toFixed(0)} m 離れています）` : "";
-  if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 500]);
+  if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 500]);  // iPhoneは非対応
   beep();
   $("bannerText").textContent = "🛴 " + msg + " " + detail;
   $("banner").style.display = "block";
@@ -149,12 +206,20 @@ function onReunited(dist) {
   log(`✓ 近づきました: ${dist.toFixed(1)} m`);
 }
 
+// iPhoneではタップ操作の中で作ったAudioContextでないと鳴らないため、ボタン操作時に1回だけ作って使い回す
+function unlockAudio() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch {}
+}
+
 function beep() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    osc.frequency.value = 880; osc.connect(ctx.destination);
-    osc.start(); osc.stop(ctx.currentTime + 0.6);
+    unlockAudio();
+    const osc = audioCtx.createOscillator();
+    osc.frequency.value = 880; osc.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.6);
   } catch {}
 }
 
@@ -171,7 +236,9 @@ function startPhoneGps() {
 }
 
 async function fetchKick() {
-  if ($("mode").value === "demo") {
+  const mode = $("mode").value;
+  if (mode === "ble") return;   // BLEは受信時に kick が更新される
+  if (mode === "demo") {
     if (phone) kick = offsetNorth(phone, Number($("demoDist").value));
     return;
   }
@@ -226,14 +293,17 @@ function setStatus(s, text) {
 
 // ====== UI ======
 $("mode").onchange = () => {
-  $("demoBox").hidden = $("mode").value !== "demo";
-  $("apiBox").hidden = $("mode").value !== "api";
+  const m = $("mode").value;
+  $("bleBox").hidden  = m !== "ble";
+  $("demoBox").hidden = m !== "demo";
+  $("apiBox").hidden  = m !== "api";
 };
 $("demoDist").oninput = () => $("demoVal").textContent = $("demoDist").value;
-
+$("bleBtn").onclick = connectBle;
 $("bannerClose").onclick = () => $("banner").style.display = "none";
 
 $("testBtn").onclick = async () => {
+  unlockAudio();
   if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission();
   notifyReminder(null);
 };
@@ -249,12 +319,16 @@ $("startBtn").onclick = async () => {
   if (watchId !== null) {   // 停止
     navigator.geolocation.clearWatch(watchId);
     clearInterval(pollTimer); clearInterval(tickTimer);
+    if (wakeLock) { try { wakeLock.release(); } catch {} wakeLock = null; }
     watchId = null; phone = kick = null; overCount = 0;
     setStatus("idle", "停止中"); $("startBtn").textContent = "監視開始";
     return;
   }
   if (!("geolocation" in navigator)) return log("このブラウザはGPS非対応です");
+  unlockAudio();
   if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission();
+  // 画面が消えると監視が止まるため、画面を点けたままにする（対応ブラウザのみ）
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch { log("画面の常時点灯は使えません。画面を消さないでください"); }
   startPhoneGps();
   pollTimer = setInterval(fetchKick, 3000);
   tickTimer = setInterval(evaluate, 1000);
